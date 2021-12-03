@@ -465,6 +465,26 @@
                    `((with-latest . "foo")))))
           (package-version (t p)))))
 
+(test-equal "options->transformation, tune"
+  '(cpu-tuning . "superfast")
+  (let* ((p0 (dummy-package "p0"))
+         (p1 (dummy-package "p1"
+               (inputs `(("p0" ,p0)))
+               (properties '((tunable? . #t)))))
+         (p2 (dummy-package "p2"
+               (inputs `(("p1" ,p1)))))
+         (t  (options->transformation '((tune . "superfast"))))
+         (p3 (t p2)))
+    (and (not (package-replacement p3))
+         (match (package-inputs p3)
+           ((("p1" tuned))
+            (match (package-inputs tuned)
+              ((("p0" p0))
+               (and (not (package-replacement p0))
+                    (assq 'cpu-tuning
+                          (package-properties
+                           (package-replacement tuned)))))))))))
+
 (test-equal "options->transformation + package->manifest-entry"
   '((transformations . ((without-tests . "foo"))))
   (let* ((p (dummy-package "foo"))

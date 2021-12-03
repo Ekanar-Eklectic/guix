@@ -29,6 +29,7 @@
   #:autoload   (guix upstream) (package-latest-release
                                 upstream-source-version
                                 upstream-source-signature-urls)
+  #:autoload   (guix cpu) (current-cpu cpu->gcc-architecture)
   #:use-module (guix utils)
   #:use-module (guix memoization)
   #:use-module (guix gexp)
@@ -48,6 +49,9 @@
   #:use-module (ice-9 vlist)
   #:export (options->transformation
             manifest-entry-with-transformations
+
+            tunable-package?
+            tuned-package
 
             show-transformation-options-help
             %transformation-options))
@@ -419,6 +423,120 @@ the equal sign."
             obj)
         obj)))
 
+(define tuning-compiler
+  (mlambda (micro-architecture)
+    "Return a compiler wrapper that passes '-march=MICRO-ARCHITECTURE' to the
+actual compiler."
+    (define wrapper
+      #~(begin
+          (use-modules (ice-9 match))
+
+          (define* (search-next command
+                                #:optional
+                                (path (string-split (getenv "PATH")
+                                                    #\:)))
+            ;; Search the next COMMAND on PATH, a list of
+            ;; directories representing the executable search path.
+            (define this
+              (stat (car (command-line))))
+
+            (let loop ((path path))
+              (match path
+                (()
+                 (match command
+                   ("cc" (search-next "gcc"))
+                   (_ #f)))
+                ((directory rest ...)
+                 (let* ((file (string-append
+                               directory "/" command))
+                        (st   (stat file #f)))
+                   (if (and st (not (equal? this st)))
+                       file
+                       (loop rest)))))))
+
+          (match (command-line)
+            ((command arguments ...)
+             (match (search-next (basename command))
+               (#f (exit 127))
+               (next
+                (apply execl next
+                       (append (cons next arguments)
+                           (list (string-append "-march="
+                                                #$micro-architecture))))))))))
+
+    (define program
+      (program-file (string-append "tuning-compiler-wrapper-" micro-architecture)
+                    wrapper))
+
+    (computed-file (string-append "tuning-compiler-" micro-architecture)
+                   (with-imported-modules '((guix build utils))
+                     #~(begin
+                         (use-modules (guix build utils))
+
+                         (define bin (string-append #$output "/bin"))
+                         (mkdir-p bin)
+
+                         (for-each (lambda (program)
+                                     (symlink #$program
+                                              (string-append bin "/" program)))
+                                   '("cc" "gcc" "clang" "g++" "c++" "clang++")))))))
+
+(define (tuned-package p micro-architecture)
+  "Return package P tuned for MICRO-ARCHITECTURE."
+  (define compiler
+    (tuning-compiler micro-architecture))
+
+  (package
+    (inherit p)
+    (native-inputs
+     ;; Arrange so that COMPILER comes first in $PATH.
+     `(("tuning-compiler" ,compiler)
+       ,@(package-native-inputs p)))
+    (arguments
+     (substitute-keyword-arguments (package-arguments p)
+       ((#:tests? _ #f) #f)))
+    (properties
+     `((cpu-tuning . ,micro-architecture)
+       ,@(package-properties p)))))
+
+(define (tunable-package? package)
+  "Return true if package PACKAGE is \"tunable\"--i.e., if tuning it for the
+host CPU is worthwhile."
+  (assq 'tunable? (package-properties package)))
+
+(define package-tuning
+  (mlambda (micro-architecture)
+    "Return a procedure that maps the given package to its counterpart tuned
+for MICRO-ARCHITECTURE, a string suitable for GCC's '-march'."
+    (define rewriting-property
+      (gensym " package-tuning"))
+
+    (package-mapping (lambda (p)
+                       (cond ((assq rewriting-property (package-properties p))
+                              p)
+                             ((assq 'tunable? (package-properties p))
+                              (package/inherit p
+                                (replacement (tuned-package p micro-architecture))
+                                (properties `((,rewriting-property . #t)
+                                              ,@(package-properties p)))))
+                             (else
+                              p)))
+                     (lambda (p)
+                       (assq rewriting-property (package-properties p)))
+                     #:deep? #t)))
+
+(define (transform-package-tuning micro-architectures)
+  "Return a procedure that, when "
+  (match micro-architectures
+    ((micro-architecture _ ...)
+     (info (G_ "tuning for CPU micro-architecture ~a~%")
+           micro-architecture)
+     (let ((rewrite (package-tuning micro-architecture)))
+       (lambda (obj)
+         (if (package? obj)
+             (rewrite obj)
+             obj))))))
+
 (define (transform-package-with-debug-info specs)
   "Return a procedure that, when passed a package, set its 'replacement' field
 to the same package but with #:strip-binaries? #f in its 'arguments' field."
@@ -601,6 +719,7 @@ are replaced by their latest upstream version."
     (with-commit . ,transform-package-source-commit)
     (with-git-url . ,transform-package-source-git-url)
     (with-c-toolchain . ,transform-package-toolchain)
+    (tune . ,transform-package-tuning)
     (with-debug-info . ,transform-package-with-debug-info)
     (without-tests . ,transform-package-tests)
     (with-patch  . ,transform-package-patches)
@@ -640,6 +759,21 @@ are replaced by their latest upstream version."
                   (parser 'with-git-url))
           (option '("with-c-toolchain") #t #f
                   (parser 'with-c-toolchain))
+          (option '("tune") #f #t
+                  (lambda (opt name arg result . rest)
+                    (define micro-architecture
+                      (match arg
+                        ((or #f "native")
+                         (cpu->gcc-architecture (current-cpu)))
+                        ("generic" #f)
+                        (_ arg)))
+
+                    (apply values
+                           (if micro-architecture
+                               (alist-cons 'tune micro-architecture
+                                           result)
+                               (alist-delete 'tune result))
+                           rest)))
           (option '("with-debug-info") #t #f
                   (parser 'with-debug-info))
           (option '("without-tests") #t #f
